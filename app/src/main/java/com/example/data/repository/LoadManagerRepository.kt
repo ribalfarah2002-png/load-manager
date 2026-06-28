@@ -300,6 +300,16 @@ class LoadManagerRepository(private val context: Context) {
         }
     }
 
+    fun getRemainingProtectionTime(device: DeviceEntity): Int {
+        if (device.deviceType == "انارة") return 0
+        val lastChange = device.lastStateChangeTime
+        if (lastChange == 0L) return 0
+        val elapsedSec = (System.currentTimeMillis() - lastChange) / 1000
+        val limit = if (device.isOn) device.timeToOn else device.timeToOff
+        val remaining = limit - elapsedSec
+        return if (remaining > 0) remaining.toInt() else 0
+    }
+
     private fun startSimulationLoop() {
         ioScope.launch {
             while (isActive) {
@@ -312,24 +322,37 @@ class LoadManagerRepository(private val context: Context) {
                         performBackgroundAutoDiscovery(currentSettings.espIpAddress)
                     }
 
+                    val firstDevice = devices.firstOrNull()
                     for (device in devices) {
+                        val isFirst = firstDevice?.id == device.id
                         var updatedDevice = device
 
-                        // 1. Fetch real or simulated sensor values
-                        updatedDevice = if (currentSettings.isSimulatorEnabled) {
-                            runSimulationSensor(updatedDevice, currentSettings)
+                        // 1. Fetch real or simulated sensor values (Only first device gets actual reading)
+                        updatedDevice = if (isFirst) {
+                            if (currentSettings.isSimulatorEnabled) {
+                                runSimulationSensor(updatedDevice, currentSettings)
+                            } else {
+                                runRealEspSensor(updatedDevice, currentSettings.espIpAddress, currentSettings)
+                            }
                         } else {
-                            runRealEspSensor(updatedDevice, currentSettings.espIpAddress, currentSettings)
+                            // Non-first devices do not display any readings and do not control any device
+                            updatedDevice.copy(
+                                voltage = 0.0,
+                                current = 0.0,
+                                activePower = 0.0,
+                                frequency = 0.0,
+                                powerFactor = 0.0
+                            )
                         }
 
                         // 2. Scheduled Hours Engine
-                        updatedDevice = runScheduledHoursEngine(updatedDevice)
+                        updatedDevice = runScheduledHoursEngine(updatedDevice, isFirst)
 
                         // 3. Seconds Plan Engine
-                        updatedDevice = runSecondsPlanEngine(updatedDevice)
+                        updatedDevice = runSecondsPlanEngine(updatedDevice, isFirst)
 
                         // 4. Max Cost Limit Engine (Highest priority constraint)
-                        updatedDevice = runMaxCostEngine(updatedDevice)
+                        updatedDevice = runMaxCostEngine(updatedDevice, isFirst)
 
                         // Save updates
                         if (updatedDevice != device) {
@@ -400,6 +423,8 @@ class LoadManagerRepository(private val context: Context) {
         val p = if (isEspConnected) lastEspPower else 0.0
         val eWh = if (isEspConnected && lastEspEnergyWh > 0) lastEspEnergyWh else device.energyWh
         val freq = if (isEspConnected) lastEspFrequency else 50.0
+        
+        // Calculate power factor or use telemetry PF directly as requested
         val pf = if (isEspConnected) lastEspPowerFactor else 1.0
 
         // Multi-bracket billing logic: uses dynamic values sync'd from settings
@@ -424,7 +449,7 @@ class LoadManagerRepository(private val context: Context) {
         )
     }
 
-    private suspend fun runScheduledHoursEngine(device: DeviceEntity): DeviceEntity {
+    private suspend fun runScheduledHoursEngine(device: DeviceEntity, isFirst: Boolean): DeviceEntity {
         if (device.scheduledHoursStatus != 1) return device // 1 is Running
 
         // Get current system time of day
@@ -437,18 +462,27 @@ class LoadManagerRepository(private val context: Context) {
         val slots = getSlotsSet(device.selectedSlotsCsv)
         val shouldBeOn = slots.contains(slotIndex)
 
-        return if (device.isOn != shouldBeOn) {
+        if (device.isOn != shouldBeOn) {
+            // Apply protective time bounds to automated plan scheduling
+            val remaining = getRemainingProtectionTime(device)
+            if (remaining > 0) {
+                // Defer action
+                return device
+            }
+
             // Send trigger to relay
-            if (!settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
+            if (isFirst && !settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
                 triggerEspRelay(shouldBeOn)
             }
-            device.copy(isOn = shouldBeOn)
-        } else {
-            device
+            return device.copy(
+                isOn = shouldBeOn,
+                lastStateChangeTime = System.currentTimeMillis()
+            )
         }
+        return device
     }
 
-    private suspend fun runSecondsPlanEngine(device: DeviceEntity): DeviceEntity {
+    private suspend fun runSecondsPlanEngine(device: DeviceEntity, isFirst: Boolean): DeviceEntity {
         if (device.secondsPlanStatus != 1) return device // 1 is Running
 
         // Ensure safe non-zero durations to prevent infinite freezing loops
@@ -458,15 +492,17 @@ class LoadManagerRepository(private val context: Context) {
         var timeLeft = device.secondsTimeLeftInPhase - 1
         var phaseIsOn = device.currentSecondsPhaseIsOn
         var activeOnState = device.isOn
+        var stateChanged = false
 
         if (timeLeft <= 0) {
             // Toggle active phase
             phaseIsOn = !phaseIsOn
             timeLeft = if (phaseIsOn) secOn else secOff
             activeOnState = phaseIsOn
+            stateChanged = true
             
             // Trigger physical relay
-            if (!settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
+            if (isFirst && !settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
                 triggerEspRelay(activeOnState)
             }
         }
@@ -474,41 +510,50 @@ class LoadManagerRepository(private val context: Context) {
         return device.copy(
             isOn = activeOnState,
             currentSecondsPhaseIsOn = phaseIsOn,
-            secondsTimeLeftInPhase = timeLeft
+            secondsTimeLeftInPhase = timeLeft,
+            lastStateChangeTime = if (stateChanged) System.currentTimeMillis() else device.lastStateChangeTime
         )
     }
 
-    private suspend fun runMaxCostEngine(device: DeviceEntity): DeviceEntity {
+    private suspend fun runMaxCostEngine(device: DeviceEntity, isFirst: Boolean): DeviceEntity {
         // Only trigger if cost limits are running
         if (device.isMaxCostActive && device.maxCostStatus == 1) {
             if (device.costSyp >= device.maxCostLimit) {
-                // Limit achieved! Turn off device immediately.
-                if (device.isOn && !settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
-                    triggerEspRelay(false)
-                }
-
-                // Insert high priority alert only once when transition occurs
                 if (device.isOn) {
+                    // Check if protection is still active (device is currently ON)
+                    val remaining = getRemainingProtectionTime(device)
+                    if (remaining > 0) {
+                        // Protected! Do not turn off yet.
+                        return device
+                    }
+
+                    // Limit achieved! Turn off device immediately.
+                    if (isFirst && !settingsDao.getSettingsDirect()?.isSimulatorEnabled!!) {
+                        triggerEspRelay(false)
+                    }
+
+                    // Insert high priority alert only once when transition occurs
                     val maxLimitAlert = AlertEntity(
                         deviceId = device.id,
                         deviceName = device.name,
                         timestamp = System.currentTimeMillis(),
                         title = "تم بلوغ الحد الأقصى للتكلفة",
-                        message = "تم فصل التغذية عن جهاز [${device.name}] لوصول كلفة استهلاكه للحد الأقصى المجدول: ${device.maxCostLimit} ل.س.",
+                        message = "تم فصل التغذية عن جهاز [${device.name}] لوصول كلفة استهلاكه للحد الأقصى المجدول: ${device.maxCostLimit} ل.س. (بعد انتهاء فترة الحماية)",
                         cause = "تجاوز حد الميزانية المالي",
                         severity = "danger"
                     )
                     alertDao.insertAlert(maxLimitAlert)
-                }
 
-                return device.copy(
-                    isOn = false,
-                    isManualOn = false,
-                    // Keep maxCostStatus = 1 so that the plan stays active and control buttons are preserved
-                    maxCostStatus = 1,
-                    scheduledHoursStatus = if (device.scheduledHoursStatus == 1) 2 else device.scheduledHoursStatus, // Pause scheduled if running
-                    secondsPlanStatus = if (device.secondsPlanStatus == 1) 2 else device.secondsPlanStatus // Pause seconds if running
-                )
+                    return device.copy(
+                        isOn = false,
+                        isManualOn = false,
+                        lastStateChangeTime = System.currentTimeMillis(),
+                        // Keep maxCostStatus = 1 so that the plan stays active and control buttons are preserved
+                        maxCostStatus = 1,
+                        scheduledHoursStatus = if (device.scheduledHoursStatus == 1) 2 else device.scheduledHoursStatus, // Pause scheduled if running
+                        secondsPlanStatus = if (device.secondsPlanStatus == 1) 2 else device.secondsPlanStatus // Pause seconds if running
+                    )
+                }
             }
         }
         return device
@@ -644,7 +689,11 @@ class LoadManagerRepository(private val context: Context) {
                                   oldDevice.scheduledHoursStatus != device.scheduledHoursStatus ||
                                   oldDevice.maxCostStatus != device.maxCostStatus ||
                                   oldDevice.isManualMode != device.isManualMode
-                if (stateChanged || planChanged) {
+                
+                val allDevices = deviceDao.getAllDevicesDirect()
+                val isFirst = allDevices.firstOrNull()?.id == device.id
+                
+                if (isFirst && (stateChanged || planChanged)) {
                     triggerEspRelay(device.isOn)
                 }
             }

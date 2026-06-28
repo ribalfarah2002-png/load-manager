@@ -57,6 +57,7 @@ fun DevicesScreen(
     // Dropdown state
     var dropdownExpanded by remember { mutableStateOf(false) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var deviceToEdit by remember { mutableStateOf<DeviceEntity?>(null) }
 
     Column(
         modifier = Modifier
@@ -196,19 +197,68 @@ fun DevicesScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
-                        Text(
-                            text = currentDevice.name,
-                            color = Color.White,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = if (currentDevice.isOn) "مغلق الدفوع (تشغيل)" else "مفتوح الدفوع (إيقاف)",
-                            color = if (currentDevice.isOn) ElectricTeal else TextSecondary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium
-                        )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Column {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = currentDevice.name,
+                                    color = Color.White,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                IconButton(
+                                    onClick = { deviceToEdit = currentDevice },
+                                    modifier = Modifier.size(28.dp).testTag("edit_device_icon_${currentDevice.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Info,
+                                        contentDescription = "تعديل معلومات الجهاز",
+                                        tint = ElectricCyan,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                text = if (currentDevice.isOn) "مغلق الدفوع (تشغيل)" else "مفتوح الدفوع (إيقاف)",
+                                color = if (currentDevice.isOn) ElectricTeal else TextSecondary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            var remainingSec by remember(currentDevice.id, currentDevice.lastStateChangeTime, currentDevice.isOn) {
+                                mutableStateOf(0)
+                            }
+                            LaunchedEffect(currentDevice.id, currentDevice.lastStateChangeTime, currentDevice.isOn) {
+                                while (true) {
+                                    if (currentDevice.deviceType == "انارة" || currentDevice.lastStateChangeTime == 0L) {
+                                        remainingSec = 0
+                                    } else {
+                                        val elapsedSec = (System.currentTimeMillis() - currentDevice.lastStateChangeTime) / 1000
+                                        val limit = if (currentDevice.isOn) currentDevice.timeToOn else currentDevice.timeToOff
+                                        val remaining = limit - elapsedSec
+                                        remainingSec = if (remaining > 0) remaining.toInt() else 0
+                                    }
+                                    if (remainingSec == 0) break
+                                    kotlinx.coroutines.delay(1000)
+                                }
+                            }
+
+                            if (remainingSec > 0) {
+                                Text(
+                                    text = "متبقي للحماية: $remainingSec ثانية",
+                                    color = NeonGold,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                            }
+                        }
                     }
 
                     Switch(
@@ -573,6 +623,210 @@ fun DevicesScreen(
                 }
             },
             containerColor = sheetColor
+        )
+    }
+
+    // Modal editing existing device
+    val editingDevice = deviceToEdit
+    if (editingDevice != null) {
+        var editDeviceName by remember(editingDevice.id) { mutableStateOf(editingDevice.name) }
+        val deviceTypes = listOf(
+            "ضاغط (مكيف - براد - ثلاجة...)" to "ضاغط",
+            "احمال حرارية (مدفئة كهربائية - مكواة - سخان مياه...)" to "حمل حراري",
+            "اجهزة كهربائية متنوعة (مروحة - خلاط - جلاية - غسالة - شواحن...)" to "اجهزة كهربائية",
+            "انارة" to "انارة"
+        )
+        // Find current type index
+        val initialIdx = deviceTypes.indexOfFirst { it.second == editingDevice.deviceType }.let { if (it == -1) 3 else it }
+        var selectedTypeIndex by remember(editingDevice.id) { mutableStateOf(initialIdx) }
+        var isDropdownExpanded by remember { mutableStateOf(false) }
+
+        var timeToOnStr by remember(editingDevice.id) { mutableStateOf(editingDevice.timeToOn.let { if (it == 0) "" else it.toString() }) }
+        var timeToOffStr by remember(editingDevice.id) { mutableStateOf(editingDevice.timeToOff.let { if (it == 0) "" else it.toString() }) }
+
+        val onTypeSelected = { index: Int ->
+            selectedTypeIndex = index
+            when (deviceTypes[index].second) {
+                "ضاغط" -> {
+                    timeToOnStr = "15"
+                    timeToOffStr = "15"
+                }
+                "حمل حراري" -> {
+                    timeToOnStr = "10"
+                    timeToOffStr = "10"
+                }
+                "اجهزة كهربائية" -> {
+                    timeToOnStr = "5"
+                    timeToOffStr = "5"
+                }
+                "انارة" -> {
+                    timeToOnStr = ""
+                    timeToOffStr = ""
+                }
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { deviceToEdit = null },
+            title = {
+                Text(
+                    text = "تعديل جهاز التحكم الذكي",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    textAlign = TextAlign.Right,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "قم بتعديل معلومات الجهاز المرتبط بدارة ESP8266 والـ PZEM لحساب القراءات والتحكم بالتشغيل:",
+                        color = TextSecondary,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Right,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = editDeviceName,
+                        onValueChange = { editDeviceName = it },
+                        label = { Text("اسم الجهاز (مثل: المكيف)") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = ElectricCyan,
+                            unfocusedBorderColor = BorderDark
+                        ),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().testTag("edit_device_name_field")
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        text = "نوع الجهاز:",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Right,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // Dropdown menu container
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { isDropdownExpanded = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, BorderDark),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = ElectricCyan)
+                                Text(
+                                    text = deviceTypes[selectedTypeIndex].first,
+                                    textAlign = TextAlign.Right,
+                                    color = Color.White,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                        DropdownMenu(
+                            expanded = isDropdownExpanded,
+                            onDismissRequest = { isDropdownExpanded = false },
+                            modifier = Modifier.fillMaxWidth().background(CyberSlate)
+                        ) {
+                            deviceTypes.forEachIndexed { idx, pair ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = pair.first,
+                                            color = Color.White,
+                                            textAlign = TextAlign.Right,
+                                            modifier = Modifier.fillMaxWidth(),
+                                            fontSize = 12.sp
+                                        )
+                                    },
+                                    onClick = {
+                                        onTypeSelected(idx)
+                                        isDropdownExpanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = timeToOffStr,
+                            onValueChange = { timeToOffStr = it },
+                            label = { Text("الوقت للاطفاء (ثانية)") },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = BorderDark
+                            ),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        OutlinedTextField(
+                            value = timeToOnStr,
+                            onValueChange = { timeToOnStr = it },
+                            label = { Text("الوقت للتشغيل (ثانية)") },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = BorderDark
+                            ),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (editDeviceName.isNotBlank()) {
+                            val type = deviceTypes[selectedTypeIndex].second
+                            val tOn = timeToOnStr.toIntOrNull() ?: 0
+                            val tOff = timeToOffStr.toIntOrNull() ?: 0
+                            viewModel.updateDeviceProperties(
+                                device = editingDevice,
+                                name = editDeviceName,
+                                deviceType = type,
+                                timeToOn = tOn,
+                                timeToOff = tOff
+                            )
+                            deviceToEdit = null
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ElectricTeal)
+                ) {
+                    Text("حفظ التعديلات", color = CyberNavy, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deviceToEdit = null }) {
+                    Text("إلغاء", color = TextSecondary)
+                }
+            },
+            containerColor = CyberSlate
         )
     }
 }

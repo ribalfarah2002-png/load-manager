@@ -618,12 +618,42 @@ fun DeviceGridCard(
                             .background(if (device.isOn) ElectricTeal else Color.Gray)
                     )
 
-                    Text(
-                        text = device.name,
-                        color = Color.White,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Column {
+                        Text(
+                            text = device.name,
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        
+                        var remainingSec by remember(device.id, device.lastStateChangeTime, device.isOn) {
+                            mutableStateOf(0)
+                        }
+                        LaunchedEffect(device.id, device.lastStateChangeTime, device.isOn) {
+                            while (true) {
+                                if (device.deviceType == "انارة" || device.lastStateChangeTime == 0L) {
+                                    remainingSec = 0
+                                } else {
+                                    val elapsedSec = (System.currentTimeMillis() - device.lastStateChangeTime) / 1000
+                                    val limit = if (device.isOn) device.timeToOn else device.timeToOff
+                                    val remaining = limit - elapsedSec
+                                    remainingSec = if (remaining > 0) remaining.toInt() else 0
+                                }
+                                if (remainingSec == 0) break
+                                kotlinx.coroutines.delay(1000)
+                            }
+                        }
+
+                        if (remainingSec > 0) {
+                            Text(
+                                text = "متبقي للحماية: $remainingSec ثانية",
+                                color = NeonGold,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
                 }
 
                 // Switch Slider to Toggle

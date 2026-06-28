@@ -125,8 +125,23 @@ class LoadManagerViewModel(application: Application) : AndroidViewModel(applicat
             protectionBlockedMessage.value = "لا يمكن $actionWord الا بعد مرور المدة المتبقية لحماية التجهيزة ($remaining ثانية)"
             showProtectionBlockedDialog.value = true
         } else {
-            val actionWord = if (device.isOn) "اطفاء" else "تشغيل"
-            stateChangeConfirmMessage.value = "هل انت متاكد انك تريد $actionWord الجهاز؟"
+            val isOnlyMaxCostActiveAndNotReached = (device.maxCostStatus == 1) &&
+                    (device.scheduledHoursStatus != 1) &&
+                    (device.secondsPlanStatus != 1) &&
+                    (device.costSyp < device.maxCostLimit)
+
+            val hasActiveAutoPlan = !device.isManualMode && (
+                    device.maxCostStatus == 1 ||
+                    device.scheduledHoursStatus == 1 ||
+                    device.secondsPlanStatus == 1
+            ) && !isOnlyMaxCostActiveAndNotReached
+
+            if (hasActiveAutoPlan) {
+                stateChangeConfirmMessage.value = "سيتم الانتقال للوضع اليدوي وسيتم الإيقاف المؤقت لجميع الخطط التلقائية. هل أنت موافق؟"
+            } else {
+                val actionWord = if (device.isOn) "اطفاء" else "تشغيل"
+                stateChangeConfirmMessage.value = "هل انت متاكد انك تريد $actionWord الجهاز؟"
+            }
             deviceToToggle = device
             showStateChangeConfirmDialog.value = true
         }
@@ -281,11 +296,25 @@ class LoadManagerViewModel(application: Application) : AndroidViewModel(applicat
 
             val isCurrentSlotActive = slots.contains(slotIndex)
 
+            // If starting the plan changes the device's state, check remaining protection seconds first!
+            val finalIsOn = if (device.isOn != isCurrentSlotActive) {
+                val remaining = getRemainingProtectionTime(device)
+                if (remaining > 0) {
+                    // Protected! Defer the state change by keeping current state and let background engine handle it
+                    device.isOn
+                } else {
+                    isCurrentSlotActive
+                }
+            } else {
+                device.isOn
+            }
+
             repository.updateDevice(
                 device.copy(
                     selectedSlotsCsv = activeSlotsCsv,
                     scheduledHoursStatus = 1, // Running
-                    isOn = isCurrentSlotActive
+                    isOn = finalIsOn,
+                    lastStateChangeTime = if (finalIsOn != device.isOn) System.currentTimeMillis() else device.lastStateChangeTime
                 )
             )
         }
@@ -294,7 +323,37 @@ class LoadManagerViewModel(application: Application) : AndroidViewModel(applicat
     fun pauseScheduledHoursPlan(device: DeviceEntity) {
         viewModelScope.launch {
             val nextStatus = if (device.scheduledHoursStatus == 2) 1 else 2
-            repository.updateDevice(device.copy(scheduledHoursStatus = nextStatus))
+            
+            val finalIsOn = if (nextStatus == 1) {
+                val slots = getSlotsSet(device.selectedSlotsCsv)
+                val cal = java.util.Calendar.getInstance()
+                val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+                val minute = cal.get(java.util.Calendar.MINUTE)
+                val minutesSinceMidnight = hour * 60 + minute
+                val slotIndex = minutesSinceMidnight / 5
+
+                val isCurrentSlotActive = slots.contains(slotIndex)
+                if (device.isOn != isCurrentSlotActive) {
+                    val remaining = getRemainingProtectionTime(device)
+                    if (remaining > 0) {
+                        device.isOn
+                    } else {
+                        isCurrentSlotActive
+                    }
+                } else {
+                    device.isOn
+                }
+            } else {
+                device.isOn
+            }
+
+            repository.updateDevice(
+                device.copy(
+                    scheduledHoursStatus = nextStatus,
+                    isOn = finalIsOn,
+                    lastStateChangeTime = if (finalIsOn != device.isOn) System.currentTimeMillis() else device.lastStateChangeTime
+                )
+            )
         }
     }
 
@@ -392,6 +451,18 @@ class LoadManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     // CRUD Device Actions
+    fun updateDeviceProperties(device: DeviceEntity, name: String, deviceType: String, timeToOn: Int, timeToOff: Int) {
+        viewModelScope.launch {
+            val updated = device.copy(
+                name = name,
+                deviceType = deviceType,
+                timeToOn = timeToOn,
+                timeToOff = timeToOff
+            )
+            repository.updateDevice(updated)
+        }
+    }
+
     fun createNewDevice(name: String, deviceType: String = "انارة", timeToOn: Int = 0, timeToOff: Int = 0) {
         viewModelScope.launch {
             val newDevice = DeviceEntity(
